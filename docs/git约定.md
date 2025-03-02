@@ -1,4 +1,5 @@
 # 该github使用规则
+
 主分支是main
 每个人要编辑都得创建一个自己的分支，命名方式为"name_dev"
 如我的分支就是："gonghaixin_dev"
