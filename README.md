@@ -11,3 +11,4 @@
 
 github规则见：[github规则](docs/git约定.md)
 
+项目日志见：[项目日志](docs/项目日志.md)
