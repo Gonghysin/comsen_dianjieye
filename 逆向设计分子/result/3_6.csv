@@ -1,0 +1,16 @@
+SMILES,Affinity,Ionization
+C(=C(C#N)C#N)(C(=C(C#N)C#N)C#N)C#N,4.08,7.05
+[N](C#N)c1c(C)cc(c(c1)Cl)[N]C#N,3.53,6.16
+c1cc2c(cc1NC(=O)C)C(=O)c1c(C2=O)cc(cc1)NC(=O)C,3.61,6.46
+c1cc2c(cc1C)C(=O)c1c(C2=O)cc(cc1)c1ccccc1,3.56,6.43
+C(#N)C1=C(C#N)C(=O)C=CC1=O,3.7,7.15
+C(#N)C1=C(C#N)C(=O)C(=C(C1=O)Cl)Cl,3.92,6.57
+O(OC(F)(F)F)C(F)(F)F,4.67,7.63
+[Zn][N][C][C](C#N)C#N,3.57,6.64
+[Zn]N([Si](C)(C)C)[Si](C)(C)C,3.56,6.31
+[N]1[S@@]([O])(O[Zn]O[S@@]1([O])C(F)(F)F)C(F)(F)F,4.21,8.31
+n12c(c(nc1C(F)(F)F)C#N)[C]=N[Mg]2,3.56,7.39
+C(S1(O[Zn]O1)[O])(F)(F)F,3.9,9.62
+n1(c(c(nc1C(F)(F)F)C#N)C#N)[Zn],4.14,7.5
+[N]1[P@](=O)(C(F)(F)F)C2=C([P@]1(=O)C(F)(F)F)O[Mg]O2,4.77,6.2
+C/C(=N/c1cc(=c2ccn(C)cc2)ccn1CCl)/O,4.289947468961759,8.253162176185382
