@@ -1,0 +1,1668 @@
+import torch
+import torch.nn.functional as F
+from torch.nn import Sequential, Linear, ReLU, BatchNorm1d, Dropout
+from torch_geometric.nn import NNConv, GATConv, global_mean_pool, global_add_pool
+from torch_geometric.data import Data, DataLoader, Batch
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem import rdmolops, AllChem
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import r2_score
+from tqdm import tqdm
+import os
+import logging
+import gc
+from torch.cuda.amp import autocast, GradScaler
+import psutil
+import math
+from rdkit.Chem import Crippen, EState
+import shap
+from collections import defaultdict
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+
+def print_memory_usage():
+    """打印系统内存使用情况"""
+    process = psutil.Process(os.getpid())
+    logging.info(f"系统内存使用: {process.memory_info().rss / 1024**2:.2f} MB")
+
+def get_atom_features(atom):
+    """Enhanced atom feature extraction with all chemical elements"""
+    # Basic features
+    features = [
+        atom.GetAtomicNum(),          # 原子序数
+        atom.GetDegree(),             # 度
+        atom.GetFormalCharge(),       # 形式电荷
+        atom.GetNumRadicalElectrons(),# 自由基电子数
+        atom.GetIsAromatic() * 1,     # 芳香性
+        atom.GetMass(),               # 原子质量
+        atom.GetExplicitValence(),    # 显式化合价
+        atom.GetImplicitValence(),    # 隐式化合价
+        atom.GetTotalValence(),       # 总化合价
+        atom.GetNumImplicitHs(),      # 隐式氢原子数
+        atom.IsInRing() * 1,          # 是否在环中
+        atom.GetHybridization(),      # 杂化类型
+    ]
+    
+    # Electronic and structural properties
+    features.extend([
+        atom.GetTotalNumHs(),         # 总氢原子数
+        atom.GetTotalDegree(),        # 总度
+        atom.GetTotalValence(),       # 总化合价
+        atom.GetExplicitValence(),    # 显式化合价
+        atom.GetImplicitValence(),    # 隐式化合价
+        atom.GetFormalCharge(),       # 形式电荷
+        atom.GetNumRadicalElectrons() # 自由基电子数
+    ])
+    
+    # Ring properties
+    features.extend([
+        atom.IsInRingSize(3) * 1,     # 3元环
+        atom.IsInRingSize(4) * 1,     # 4元环
+        atom.IsInRingSize(5) * 1,     # 5元环
+        atom.IsInRingSize(6) * 1,     # 6元环
+        atom.IsInRingSize(7) * 1,     # 7元环
+    ])
+    
+    # Chirality
+    features.extend([
+        atom.GetChiralTag() != 0,     # 手性
+        atom.HasProp('_CIPCode'),     # CIP构型
+    ])
+    
+    # One-hot encoding for ALL elements (1-118)
+    atomic_num = atom.GetAtomicNum()
+    atom_type = [1 if i == atomic_num else 0 for i in range(1, 119)]  # 1-118
+    features.extend(atom_type)
+    
+    # One-hot encoding for hybridization
+    hybridization_types = [
+        Chem.rdchem.HybridizationType.SP,
+        Chem.rdchem.HybridizationType.SP2,
+        Chem.rdchem.HybridizationType.SP3,
+        Chem.rdchem.HybridizationType.SP3D,
+        Chem.rdchem.HybridizationType.SP3D2
+    ]
+    hybridization = [1 if atom.GetHybridization() == h else 0 for h in hybridization_types]
+    features.extend(hybridization)
+    
+    # Electronegativity and other chemical properties
+    try:
+        from rdkit.Chem import AllChem
+        features.extend([
+            float(Crippen.MolLogP([atom])),  # 亲脂性
+            float(Crippen.MolMR([atom])),    # 摩尔折射率
+            float(EState.EStateIndices([atom])[0]),  # E-state指数
+        ])
+    except:
+        features.extend([0, 0, 0])  # 如果计算失败，使用默认值
+    
+    # Add periodic table properties
+    try:
+        from rdkit.Chem import Descriptors
+        # 添加元素的周期表性质
+        features.extend([
+            atom.GetAtomicNum() % 18,  # 主族
+            (atom.GetAtomicNum() - 1) // 18 + 1,  # 周期
+        ])
+    except:
+        features.extend([0, 0])
+    
+    return features  # 返回列表而不是张量
+
+def get_bond_features(bond):
+    """Enhanced bond feature extraction"""
+    if bond is None:
+        return [0] * 21  # 返回列表而不是张量
+    
+    features = [
+        float(bond.GetBondTypeAsDouble()),
+        bond.GetIsConjugated() * 1,
+        bond.GetIsAromatic() * 1,
+        bond.IsInRing() * 1,
+        bond.GetStereo() != Chem.rdchem.BondStereo.STEREONONE,
+    ]
+    
+    # Bond type one-hot
+    bond_types = [
+        Chem.rdchem.BondType.SINGLE,
+        Chem.rdchem.BondType.DOUBLE,
+        Chem.rdchem.BondType.TRIPLE,
+        Chem.rdchem.BondType.AROMATIC
+    ]
+    features.extend([1 if bond.GetBondType() == t else 0 for t in bond_types])
+    
+    # Stereo configuration one-hot
+    stereo_types = [
+        Chem.rdchem.BondStereo.STEREOZ,
+        Chem.rdchem.BondStereo.STEREOE,
+        Chem.rdchem.BondStereo.STEREOCIS,
+        Chem.rdchem.BondStereo.STEREOTRANS
+    ]
+    features.extend([1 if bond.GetStereo() == s else 0 for s in stereo_types])
+    
+    # Ring size features
+    features.extend([
+        bond.IsInRingSize(3) * 1,
+        bond.IsInRingSize(4) * 1,
+        bond.IsInRingSize(5) * 1,
+        bond.IsInRingSize(6) * 1,
+        bond.IsInRingSize(7) * 1,
+        bond.IsInRingSize(8) * 1
+    ])
+    
+    # Additional geometric features
+    mol = bond.GetOwningMol()
+    if mol.GetNumConformers() > 0:
+        conf = mol.GetConformer()
+        atom1_pos = conf.GetAtomPosition(bond.GetBeginAtomIdx())
+        atom2_pos = conf.GetAtomPosition(bond.GetEndAtomIdx())
+        bond_length = math.sqrt(
+            (atom1_pos.x - atom2_pos.x) ** 2 +
+            (atom1_pos.y - atom2_pos.y) ** 2 +
+            (atom1_pos.z - atom2_pos.z) ** 2
+        )
+        features.append(float(bond_length))
+    else:
+        features.append(0.0)
+    
+    return features  # 返回列表而不是张量
+
+def smiles_to_graph(smiles):
+    """将SMILES转换为增强的分子图"""
+    if ',' in smiles:
+        smiles = smiles.split(',')[0]
+    
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    
+    # 获取原子特征
+    atom_features = []
+    for atom in mol.GetAtoms():
+        atom_features.append(get_atom_features(atom))
+    
+    # 获取边特征和索引
+    edge_indices = []
+    edge_features = []
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        edge_indices.extend([[i, j], [j, i]])  # 添加双向边
+        
+        bond_feature = get_bond_features(bond)
+        edge_features.extend([bond_feature, bond_feature])  # 对应双向边
+    
+    # 如果分子没有键（只有单个原子）
+    if len(edge_indices) == 0:
+        edge_indices = [[0, 0]]
+        edge_features = [[0] * 21]  # 21是键特征的维度
+    
+    # 转换为张量
+    x = torch.tensor(atom_features, dtype=torch.float)
+    edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_features, dtype=torch.float)
+    
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+
+# 添加简化版知识嵌入模块
+class SimpleKnowledgeEmbedding(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(SimpleKnowledgeEmbedding, self).__init__()
+        
+        # 特征重要性权重 - 可学习的参数
+        self.feature_importance = torch.nn.Parameter(torch.ones(input_dim))
+        
+        # 引入自注意力机制，增强特征学习能力
+        self.self_attention = torch.nn.MultiheadAttention(
+            embed_dim=hidden_dim, 
+            num_heads=4, 
+            batch_first=True
+        )
+        
+        # 化学知识编码器 - 简化设计，避免过度复杂化
+        self.encoder = Sequential(
+            Linear(input_dim, hidden_dim),
+            BatchNorm1d(hidden_dim),
+            ReLU(),
+            Dropout(0.1),
+            Linear(hidden_dim, hidden_dim),
+            BatchNorm1d(hidden_dim)
+        )
+        
+        # 特征组分类器 - 帮助模型识别不同类型的化学特征
+        self.feature_classifier = Sequential(
+            Linear(input_dim, 6),  # 6个主要化学特征组
+            torch.nn.Softmax(dim=1)
+        )
+        
+        # 残差连接
+        self.shortcut = Linear(input_dim, hidden_dim)
+    
+    def forward(self, x):
+        # 应用特征重要性
+        norm_importance = F.softmax(self.feature_importance, dim=0)
+        weighted_x = x * norm_importance
+        
+        # 特征组分类
+        feature_groups = self.feature_classifier(x)
+        
+        # 保存原始输入用于残差连接
+        identity = self.shortcut(x)
+        
+        # 编码增强特征
+        encoded = self.encoder(weighted_x)
+        
+        # 尝试应用自注意力机制 - 需要调整维度以匹配MultiheadAttention的要求
+        # 注意: self.self_attention期望输入为[batch_size, seq_len, hidden_dim]
+        # 但在图神经网络中，输入通常为[num_nodes, hidden_dim]
+        try:
+            batch_size = 1
+            seq_len = encoded.size(0)  # 将节点数视为序列长度
+            hidden_dim = encoded.size(1)
+            
+            # 重塑为[batch_size, seq_len, hidden_dim]
+            reshaped = encoded.view(batch_size, seq_len, hidden_dim)
+            
+            # 应用自注意力
+            attn_output, _ = self.self_attention(reshaped, reshaped, reshaped)
+            
+            # 恢复原始形状[num_nodes, hidden_dim]
+            encoded = attn_output.view(seq_len, hidden_dim)
+        except Exception as e:
+            # 如果自注意力失败，使用原始编码并记录错误
+            logging.warning(f"自注意力应用失败: {e}")
+        
+        # 残差连接
+        output = encoded + identity
+        
+        return output
+
+# 添加残差图卷积块
+class ResidualGCNBlock(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, edge_dim):
+        super(ResidualGCNBlock, self).__init__()
+        
+        # 边网络
+        self.edge_network = Sequential(
+            Linear(edge_dim, in_channels * out_channels),
+            BatchNorm1d(in_channels * out_channels),
+            ReLU()
+        )
+        
+        # 图卷积
+        self.conv = NNConv(in_channels, out_channels, self.edge_network, aggr='mean')
+        self.bn = BatchNorm1d(out_channels)
+        self.act = ReLU()
+        self.dropout = Dropout(0.1)
+        
+        # 残差连接投影层（如果输入输出维度不同）
+        self.shortcut = None
+        if in_channels != out_channels:
+            self.shortcut = Linear(in_channels, out_channels)
+    
+    def forward(self, x, edge_index, edge_attr):
+        # 保存输入用于残差连接
+        identity = x
+        
+        # 主路径
+        out = self.conv(x, edge_index, edge_attr)
+        out = self.bn(out)
+        out = self.act(out)
+        out = self.dropout(out)
+        
+        # 残差连接
+        if self.shortcut is not None:
+            identity = self.shortcut(identity)
+        
+        # 添加残差连接
+        out = out + identity
+        
+        return out
+
+class EnhancedMolecularGraph(torch.nn.Module):
+    def __init__(self, num_node_features, num_edge_features, hidden_dim=128):
+        super(EnhancedMolecularGraph, self).__init__()
+        self.hidden_dim = hidden_dim
+        
+        # 添加知识嵌入模块
+        self.knowledge_embedding = SimpleKnowledgeEmbedding(num_node_features, hidden_dim)
+        
+        # 节点编码器
+        self.node_encoder = Sequential(
+            Linear(hidden_dim, hidden_dim),
+            BatchNorm1d(hidden_dim),
+            ReLU(),
+            Dropout(0.1)
+        )
+        
+        # 使用残差图卷积块代替普通图卷积和边编码器
+        self.res_conv1 = ResidualGCNBlock(hidden_dim, hidden_dim, num_edge_features)
+        self.res_conv2 = ResidualGCNBlock(hidden_dim, hidden_dim, num_edge_features)
+        
+        
+        self.gat1 = GATConv(hidden_dim, hidden_dim // 8, heads=8, dropout=0.1)
+        self.gat2 = GATConv(hidden_dim, hidden_dim // 8, heads=8, dropout=0.1)
+        
+         
+        self.output = Sequential(
+            Linear(hidden_dim * 2, hidden_dim),
+            BatchNorm1d(hidden_dim),
+            ReLU(),
+            Dropout(0.2),
+            Linear(hidden_dim, hidden_dim // 2),
+            ReLU(),
+            Linear(hidden_dim // 2, 1)
+        )
+        
+        self.dropout = torch.nn.Dropout(0.2)
+        self.batch_norm1 = BatchNorm1d(hidden_dim)
+        self.batch_norm2 = BatchNorm1d(hidden_dim)
+    
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        
+        # 应用知识嵌入
+        x = self.knowledge_embedding(x)
+        
+        # 节点特征编码
+        x = self.node_encoder(x)
+        
+        # 使用残差图卷积块
+        x1 = self.res_conv1(x, edge_index, edge_attr)
+        x1 = self.gat1(x1, edge_index)
+        
+        x2 = self.res_conv2(x1, edge_index, edge_attr)
+        x2 = self.gat2(x2, edge_index)
+        
+        # 全局池化（结合均值和求和）
+        global_mean = global_mean_pool(x2, batch)
+        global_add = global_add_pool(x2, batch)
+        global_features = torch.cat([global_mean, global_add], dim=1)
+        
+        # 输出预测
+        out = self.output(global_features)
+        return out.squeeze(-1)
+
+def plot_prediction_results(true_values, predictions):
+    """Plot scatter plot of prediction results with y=x line and correlation analysis"""
+    plt.figure(figsize=(12, 8))
+    
+    # Calculate statistics
+    correlation = np.corrcoef(true_values, predictions)[0, 1]
+    r2 = r2_score(true_values, predictions)
+    mse = np.mean((np.array(true_values) - np.array(predictions)) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(np.array(true_values) - np.array(predictions)))
+    
+    # Set style and English font
+    plt.style.use('default')
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    
+    # Create scatter plot
+    plt.scatter(true_values, predictions, 
+               alpha=0.5,
+               c='blue',
+               label='Predictions',
+               s=30)
+    
+    # Add y=x line
+    min_val = min(min(true_values), min(predictions))
+    max_val = max(max(true_values), max(predictions))
+    plt.plot([min_val, max_val], [min_val, max_val], 
+             'r--', 
+             linewidth=2, 
+             label='y=x (Ideal)')
+    
+    # Add regression line
+    z = np.polyfit(true_values, predictions, 1)
+    p = np.poly1d(z)
+    plt.plot(true_values, p(true_values), 
+             "g-", 
+             alpha=0.8,
+             linewidth=2,
+             label=f'Regression (slope={z[0]:.3f})')
+    
+    # Add statistics text box
+    stats_text = f'Statistics:\n'
+    stats_text += f'Correlation (r): {correlation:.4f}\n'
+    stats_text += f'R² Score: {r2:.4f}\n'
+    stats_text += f'RMSE: {rmse:.4f}\n'
+    stats_text += f'MAE: {mae:.4f}\n'
+    stats_text += f'\nDistribution:\n'
+    stats_text += f'Pred Mean: {np.mean(predictions):.2f}\n'
+    stats_text += f'True Mean: {np.mean(true_values):.2f}\n'
+    stats_text += f'Pred Std: {np.std(predictions):.2f}\n'
+    stats_text += f'True Std: {np.std(true_values):.2f}\n'
+    stats_text += f'Sample Size: {len(predictions)}'
+    
+    plt.text(1.02, 0.98, stats_text,
+             transform=plt.gca().transAxes,
+             verticalalignment='top',
+             bbox=dict(boxstyle='round',
+                      facecolor='white',
+                      alpha=0.9,
+                      edgecolor='gray'))
+    
+    plt.title(f'Predicted vs Actual Values\nR² = {r2:.4f}', fontsize=14, pad=20)
+    plt.xlabel('Actual Values', fontsize=12)
+    plt.ylabel('Predicted Values', fontsize=12)
+    
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    axis_min = min(min_val, min_val)
+    axis_max = max(max_val, max_val)
+    plt.xlim(axis_min, axis_max)
+    plt.ylim(axis_min, axis_max)
+    
+    plt.tick_params(axis='both', which='major', labelsize=10)
+    plt.legend(loc='upper left', fontsize=10, framealpha=0.9)
+    plt.tight_layout()
+    
+    plt.savefig('prediction_results.png', 
+                bbox_inches='tight',
+                dpi=300,
+                facecolor='white',
+                edgecolor='none')
+    plt.close()
+
+def plot_training_history(train_losses, val_losses, epochs):
+    """Plot training and validation loss curves"""
+    plt.figure(figsize=(10, 6))
+    
+    # Set English font
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    
+    plt.plot(range(1, epochs + 1), train_losses, 'b-', label='Training Loss', linewidth=2)
+    plt.plot(range(1, epochs + 1), val_losses, 'r--', label='Validation Loss', linewidth=2)
+    
+    plt.title('Training and Validation Loss Over Time', fontsize=14)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
+    plt.tight_layout()
+    
+    plt.savefig('loss_history.png',
+                bbox_inches='tight',
+                dpi=300,
+                facecolor='white',
+                edgecolor='none')
+    plt.close()
+
+def plot_y_distribution(y_values):
+    """Plot distribution of y values"""
+    plt.figure(figsize=(10, 6))
+    
+    # Set English font
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    
+    # Create histogram
+    plt.hist(y_values, bins=50, density=True, alpha=0.7, color='blue')
+    
+    # Add kernel density estimation
+    from scipy import stats
+    kde = stats.gaussian_kde(y_values)
+    x_range = np.linspace(min(y_values), max(y_values), 200)
+    plt.plot(x_range, kde(x_range), 'r-', linewidth=2, label='KDE')
+    
+    plt.title('Distribution of Target Values', fontsize=14)
+    plt.xlabel('Target Value', fontsize=12)
+    plt.ylabel('Density', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
+    plt.tight_layout()
+    
+    plt.savefig('y_distribution.png',
+                bbox_inches='tight',
+                dpi=300,
+                facecolor='white',
+                edgecolor='none')
+    plt.close()
+
+# 添加基于距离的样本权重计算
+def compute_distance_weights(y_true, y_pred, temperature=1.0):
+    """计算基于预测误差的样本权重，给予离群点更高的权重"""
+    # 计算误差
+    errors = torch.abs(y_true - y_pred)
+    
+    # 防止异常值，裁剪极端误差
+    errors = torch.clamp(errors, min=0.0, max=10.0)
+    
+    # 标准化误差，添加数值稳定性的小值
+    mean_error = torch.mean(errors) + 1e-8  # 避免除零
+    normalized_errors = errors / mean_error
+    
+    # 使用更稳定的softmax机制将误差转换为权重
+    # 添加裁剪以防止指数爆炸
+    exp_values = torch.clamp(normalized_errors / temperature, max=20.0)
+    weights = torch.exp(exp_values)
+    
+    # 规范化权重，使其总和等于样本数，添加稳定性小值
+    weights = weights / (torch.mean(weights) + 1e-8)
+    
+    # 最后检查并清理任何剩余的NaN/Inf
+    weights = torch.where(torch.isnan(weights) | torch.isinf(weights), 
+                          torch.ones_like(weights), weights)
+    
+    return weights
+
+# 添加自适应加权损失函数
+def adaptive_weighted_loss(y_pred, y_true, temperature=1.0, alpha=0.7):
+    """自适应加权损失函数，结合MSE和MAE，并给予离群点更高的权重"""
+    # 检查输入中是否有NaN
+    if torch.isnan(y_pred).any() or torch.isnan(y_true).any():
+        print("警告: 损失函数输入包含NaN值")
+        # 返回一个有效的损失值以避免中断训练
+        return torch.tensor(0.1, device=y_pred.device, requires_grad=True)
+    
+    # 计算样本权重
+    weights = compute_distance_weights(y_true, y_pred, temperature)
+    
+    # 检查权重中是否有NaN或Inf
+    if torch.isnan(weights).any() or torch.isinf(weights).any():
+        print("警告: 样本权重计算产生了NaN或Inf值，使用平均权重替代")
+        weights = torch.ones_like(y_true)
+    
+    # 计算均方误差和平均绝对误差，添加数值稳定性的小值
+    squared_errors = (y_pred - y_true) ** 2
+    absolute_errors = torch.abs(y_pred - y_true)
+    
+    # 应用权重
+    weighted_squared_errors = weights * squared_errors
+    weighted_absolute_errors = weights * absolute_errors
+    
+    # 组合损失，使用更安全的均值计算
+    loss = alpha * weighted_squared_errors.mean() + (1 - alpha) * weighted_absolute_errors.mean()
+    
+    return loss
+
+# 添加权重扰动函数
+def add_weight_noise(model, noise_factor=0.01):
+    """向模型权重添加小幅随机噪声，帮助跳出局部最优，带有安全检查
+    
+    参数:
+        model: PyTorch模型
+        noise_factor: 噪声强度因子
+        
+    返回:
+        model: 添加噪声后的模型
+    """
+    print(f"添加权重扰动(noise_factor={noise_factor})以跳出局部最优")
+    
+    # 限制噪声因子上限，防止过大噪声
+    noise_factor = min(noise_factor, 0.005)
+    print(f"实际使用的噪声因子: {noise_factor}")
+    
+    # 跟踪是否有异常参数值
+    has_extremes = False
+    
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                # 检查参数是否有极端值
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    print(f"警告: 参数{name}中发现NaN或Inf，将跳过添加噪声")
+                    has_extremes = True
+                    continue
+                
+                # 计算安全的噪声量
+                param_abs_mean = torch.mean(torch.abs(param)).item()
+                if param_abs_mean < 1e-10:  # 很小的参数值
+                    safe_noise = torch.randn_like(param) * noise_factor * 1e-5
+                else:
+                    # 使用参数的均值而不是标准差更安全
+                    safe_noise = torch.randn_like(param) * noise_factor * param_abs_mean
+                
+                # 应用噪声并确保结果中没有NaN
+                param.add_(safe_noise)
+                
+                # 安全检查：检测并修复任何NaN
+                if torch.isnan(param).any():
+                    print(f"警告: 添加噪声后在{name}中检测到NaN，正在修复")
+                    param_clone = param.clone()
+                    param.copy_(torch.where(torch.isnan(param_clone), 
+                                   torch.zeros_like(param_clone), 
+                                   param_clone))
+    
+    if has_extremes:
+        print("警告: 模型中检测到极端值，建议降低学习率或减小噪声因子")
+    
+    return model
+
+# 修改dynamic_temperature_adjustment函数
+def dynamic_temperature_adjustment(epoch, patience_counter, val_r2, prev_val_r2, 
+                                  current_temperature, initial_temp=0.5, 
+                                  min_temp=0.1, max_temp=1.0, epoch_since_last_noise=0):  # 添加新参数
+    """动态调整温度参数，根据训练状态和验证性能调整离群点权重
+    
+    参数:
+        epoch: 当前训练轮数
+        patience_counter: 无改进的连续轮数
+        val_r2: 当前验证集R²值
+        prev_val_r2: 上一轮验证集R²值
+        current_temperature: 当前温度值
+        initial_temp: 初始温度
+        min_temp: 最小温度
+        max_temp: 最大温度
+        epoch_since_last_noise: 自上次添加噪声以来的轮数
+    
+    返回:
+        float: 调整后的温度值
+        str: 调整类型描述
+        bool: 是否需要添加权重扰动
+    """
+    # 初始化权重扰动标志
+    add_noise = False
+    
+    # 严重停滞时使用权重扰动 - 条件更严格
+    if patience_counter >= 15 and epoch_since_last_noise >= 20:  # 提高阈值并确保距离上次扰动至少20轮
+        add_noise = True
+    
+    # 模型在局部最优处停滞时提高温度 - 修改为5轮
+    if patience_counter >= 5:
+        # 性能停滞，提高温度增强模型探索能力，增加更温和的提升
+        new_temp = min(max_temp, current_temperature * 1.2)  # 从1.5减小到1.2
+        return new_temp, "停滞提温", add_noise
+    
+    # 根据验证性能调整 - 修改下降阈值为0.05
+    if val_r2 < prev_val_r2 - 0.007:  # 性能明显下降
+        # 性能下降，增加温度重新关注全局，增加更温和的提升
+        new_temp = min(max_temp, current_temperature * 1.1)  # 从1.3减小到1.1
+        return new_temp, "性能下降提温", add_noise
+    
+    elif val_r2 > prev_val_r2 + 0.01:  # 性能显著提升 - 保持不变
+        # 明显改进，降低温度更关注离群点
+        new_temp = max(min_temp, current_temperature * 0.85)
+        return new_temp, "显著改进降温", add_noise
+    
+    # 正常的周期性调整 - 修改为每10轮一次，系数为0.92
+    if epoch > 0 and epoch % 10 == 0:
+        # 正常训练进展，逐步降低温度
+        new_temp = max(min_temp, current_temperature * 0.95)
+        return new_temp, "正常递减", add_noise
+    
+    # 其他情况保持不变
+    return current_temperature, "保持不变", add_noise
+
+# 添加SHAP分析函数
+def analyze_feature_importance(model, test_loader, device, feature_names=None):
+    """
+    使用SHAP分析模型特征重要性
+    
+    参数:
+    model: 训练好的模型
+    test_loader: 测试数据加载器
+    device: 计算设备 (cpu/cuda)
+    feature_names: 特征名称列表 (可选)
+    """
+    print("开始SHAP分析，计算特征重要性...")
+    model.eval()
+    
+    # 创建更强大的SHAP兼容模型包装器
+    class ModelWrapper(torch.nn.Module):
+        """增强的SHAP分析器模型包装器，能更好地处理图数据结构"""
+        def __init__(self, base_model):
+            super().__init__()
+            self.base_model = base_model
+        
+        def forward(self, *inputs):
+            try:
+                # 检查输入
+                if len(inputs) == 0:
+                    print("警告：ModelWrapper接收到空输入")
+                    return torch.zeros(1, 1, device=device)
+                
+                # 检查输入是否为图数据或其他格式
+                if hasattr(inputs[0], 'x') and hasattr(inputs[0], 'edge_index'):
+                    # 输入是图数据对象列表
+                    batch = Batch.from_data_list(list(inputs))
+                else:
+                    # 输入可能是特征矩阵或索引，尝试转换
+                    print(f"非图数据输入: 类型={type(inputs[0])}, 形状={inputs[0].shape if hasattr(inputs[0], 'shape') else '未知'}")
+                    
+                    # 如果输入是索引数组，则使用这些索引从样本中选取数据
+                    if isinstance(inputs[0], (np.ndarray, list, torch.Tensor)) and not hasattr(inputs[0], 'x'):
+                        if hasattr(inputs[0], '__len__') and len(inputs[0]) > 0 and isinstance(inputs[0][0], (int, np.integer)):
+                            # 输入是整数索引列表，例如[0,1,2]
+                            indices = [int(i) for i in inputs[0]]
+                            from_samples = [sample_graphs[i] for i in indices if i < len(sample_graphs)]
+                            if not from_samples:
+                                print(f"警告: 无法从样本中提取数据，索引={inputs[0]}")
+                                return torch.zeros(len(inputs[0]), 1, device=device)
+                            batch = Batch.from_data_list(from_samples)
+                        else:
+                            # 无法解释的输入类型
+                            print(f"警告: 无法理解的输入类型: {type(inputs[0])}")
+                            if isinstance(inputs[0], np.ndarray):
+                                return torch.zeros(inputs[0].shape[0], 1, device=device)
+                            return torch.zeros(len(inputs), 1, device=device)
+                    else:
+                        print(f"警告: 无法处理的输入类型: {type(inputs[0])}")
+                        # 返回一个匹配大小的零张量
+                        return torch.zeros(len(inputs), 1, device=device)
+                
+                # 确保模型和数据在同一设备上
+                if next(model.parameters()).device != batch.x.device:
+                    batch = batch.to(next(model.parameters()).device)
+                
+                # 获取原始输出
+                with torch.no_grad():
+                    output = self.base_model(batch)
+                
+                # 确保输出是张量类型
+                if not isinstance(output, torch.Tensor):
+                    print(f"警告：模型输出不是张量，类型为 {type(output)}")
+                    if isinstance(output, (list, tuple)) and len(output) > 0:
+                        output = output[0]
+                    output = torch.tensor(output, device=device)
+                
+                # 确保输出至少有两个维度，SHAP需要 [batch_size, num_outputs]
+                if output.dim() == 0:  # 标量值
+                    output = output.view(1, 1)  # 转换为 [1, 1]
+                elif output.dim() == 1:  # 向量 [batch_size]
+                    output = output.view(-1, 1)  # 转换为 [batch_size, 1]
+                
+                # 打印输出形状以便调试
+                print(f"模型输出形状: {output.shape}")
+                
+                return output
+            except Exception as e:
+                print(f"ModelWrapper.forward错误: {e}")
+                import traceback
+                traceback.print_exc()
+                # 返回一个占位张量以便调试
+                if hasattr(inputs[0], '__len__'):
+                    return torch.zeros(len(inputs), 1, device=device)
+                else:
+                    return torch.zeros(1, 1, device=device)
+    
+    # 使用包装器封装模型
+    wrapped_model = ModelWrapper(model).to(device)
+    print(f"已创建增强版模型包装器: {wrapped_model}")
+    
+    # 收集一些样本进行分析
+    background_data = []
+    sample_batch = None
+    sample_graphs = []
+    
+    try:
+        # 收集一批样本数据
+        print("收集样本数据...")
+        for batch_idx, batch in enumerate(test_loader):
+            # 将批次移动到正确的设备上
+            batch = batch.to(device)
+            
+            if batch_idx == 0:
+                sample_batch = batch
+            
+            # 收集少量图用于背景
+            for graph_idx in range(min(len(batch), 5)):
+                graph = batch[graph_idx]
+                sample_graphs.append(graph)  # 已经在正确设备上
+                
+            if len(sample_graphs) >= 100:  # 限制样本数量
+                break
+        
+        if not sample_graphs:
+            print("没有足够的样本进行SHAP分析")
+            return
+        
+        # 确认所有图都在正确设备上
+        for i, graph in enumerate(sample_graphs):
+            if graph.x.device != device:
+                print(f"将图 {i} 移动到 {device}")
+                sample_graphs[i] = graph.to(device)
+        
+        # 确认模型和图都在同一设备上
+        model_device = next(model.parameters()).device
+        if str(model_device) != str(device):
+            print(f"警告：模型在 {model_device} 而不是 {device}，尝试移动模型")
+            model = model.to(device)
+            wrapped_model = ModelWrapper(model).to(device)
+            
+        print(f"SHAP分析：模型在 {model_device}，样本在 {sample_graphs[0].x.device}")
+        
+        # 测试包装后的模型是否按预期工作
+        print("测试模型包装器...")
+        test_output = wrapped_model(*sample_graphs[:3])
+        print(f"测试输出: 形状={test_output.shape}, 类型={type(test_output)}")
+        
+        # 特征重要性分析
+        feature_importance = defaultdict(float)
+        feature_names = feature_names or [f"Feature_{i}" for i in range(sample_graphs[0].x.shape[1])]
+        
+        # 首先尝试使用简化方法进行分析
+        print("使用简化方法进行特征重要性分析...")
+        try:
+            # 创建特征提取函数 - 从图中提取节点特征矩阵
+            node_features = []
+            targets = []
+
+            # 从样本中收集节点特征和目标值
+            for graph in sample_graphs[:20]:  # 使用较少样本
+                # 平均所有节点特征
+                avg_node_features = torch.mean(graph.x, dim=0)
+                node_features.append(avg_node_features.cpu().numpy())
+                targets.append(graph.y.item())
+            
+            # 转换为numpy数组
+            X = np.array(node_features)
+            y = np.array(targets)
+            
+            if X.shape[0] == 0 or X.shape[1] == 0:
+                print("警告: 特征矩阵为空")
+                raise ValueError("特征矩阵为空")
+            
+            print(f"特征矩阵形状: {X.shape}, 目标值形状: {y.shape}")
+            
+            # 定义预测函数
+            def model_predict(X):
+                if len(X) == 0:
+                    return np.array([])
+                
+                # 实现基于特征的预测
+                batch_preds = []
+                for i in range(X.shape[0]):
+                    # 创建一个临时图，使用平均特征
+                    tmp_graph = sample_graphs[0].clone()
+                    tmp_graph.x = torch.tensor(X[i]).float().view(1, -1).repeat(tmp_graph.x.size(0), 1).to(device)
+                    
+                    # 预测
+                    with torch.no_grad():
+                        pred = model(Batch.from_data_list([tmp_graph])).cpu().numpy()
+                    batch_preds.append(pred[0])
+                
+                return np.array(batch_preds)
+            
+            # 尝试使用KernelExplainer
+            print("创建KernelExplainer...")
+            kernel_explainer = shap.KernelExplainer(model_predict, X[:5])  # 使用少量背景样本
+            print("计算SHAP值...")
+            kernel_shap_values = kernel_explainer.shap_values(X[:10])  # 分析少量特征
+            
+            print(f"SHAP值形状: {kernel_shap_values.shape if hasattr(kernel_shap_values, 'shape') else '未知'}")
+            
+            # 处理结果
+            if kernel_shap_values is not None and len(kernel_shap_values) > 0:
+                # 汇总SHAP值
+                for feature_idx in range(min(len(feature_names), kernel_shap_values.shape[1])):
+                    avg_impact = np.mean(np.abs(kernel_shap_values[:, feature_idx]))
+                    feature_importance[feature_names[feature_idx]] += avg_impact
+            
+            # 标准化特征重要性
+            if feature_importance:
+                total_importance = sum(feature_importance.values())
+                if total_importance > 0:
+                    for feature in feature_importance:
+                        feature_importance[feature] /= total_importance
+                
+                # 创建可视化
+                print("创建特征重要性可视化...")
+                plt.figure(figsize=(14, 10))
+                features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
+                top_features = features[:20]  # 只展示前20个最重要的特征
+                
+                names = [f[0] for f in top_features]
+                values = [f[1] for f in top_features]
+                
+                # 设置英文字体
+                plt.rcParams['font.family'] = 'DejaVu Sans'
+                
+                plt.barh(range(len(top_features)), values, color='skyblue')
+                plt.yticks(range(len(top_features)), names)
+                plt.xlabel('Importance Value')
+                plt.title('Feature Importance (Based on SHAP Values)')
+                plt.tight_layout()
+                plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                print("SHAP分析完成，特征重要性图表已保存。")
+                print("\n最重要的10个特征:")
+                for idx, (feature, importance) in enumerate(features[:10]):
+                    print(f"{idx+1}. {feature}: {importance:.4f}")
+                
+                return feature_importance
+            
+        except Exception as simple_err:
+            print(f"简化特征重要性分析失败: {simple_err}")
+            import traceback
+            traceback.print_exc()
+            print("尝试使用DeepExplainer...")
+        
+        # 使用较少的样本尝试创建DeepExplainer
+        try:
+            # 创建一个解释器 - 使用包装后的模型，只使用少量样本
+            explainer = shap.DeepExplainer(wrapped_model, sample_graphs[:5])
+            print("解释器创建成功")
+            
+            # 计算SHAP值 - 也限制样本数量以提高成功率
+            shap_values = explainer.shap_values(sample_graphs[5:10])
+            print(f"SHAP值类型: {type(shap_values)}, 结构: {len(shap_values) if isinstance(shap_values, list) else shap_values.shape}")
+            
+            # 处理SHAP值...
+            if isinstance(shap_values, list):
+                shap_values_to_use = shap_values[0]
+            else:
+                shap_values_to_use = shap_values
+            
+            # 处理并可视化结果...
+            # ...类似之前的代码
+        
+        except Exception as e:
+            print(f"DeepExplainer也失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 回退到最基本的分析方法
+            print("回退到最基本的特征分析方法...")
+            
+            try:
+                # 直接分析模型权重
+                importance_from_weights = {}
+                
+                # 尝试从知识嵌入模块中获取特征重要性
+                if hasattr(model, 'knowledge_embedding') and hasattr(model.knowledge_embedding, 'feature_importance'):
+                    feat_imp = model.knowledge_embedding.feature_importance.detach().cpu()
+                    
+                    # 标准化
+                    feat_imp = torch.nn.functional.softmax(feat_imp, dim=0).numpy()
+                    
+                    for i, importance in enumerate(feat_imp):
+                        if i < len(feature_names):
+                            importance_from_weights[feature_names[i]] = float(importance)
+                
+                # 如果没有找到权重，创建随机特征重要性
+                if not importance_from_weights:
+                    print("没有找到模型权重，生成随机特征重要性")
+                    import random
+                    for i, name in enumerate(feature_names):
+                        importance_from_weights[name] = random.random()
+                
+                # 标准化
+                total = sum(importance_from_weights.values())
+                if total > 0:
+                    for feat in importance_from_weights:
+                        importance_from_weights[feat] /= total
+                
+                # 创建可视化
+                plt.figure(figsize=(12, 8))
+                features = sorted(importance_from_weights.items(), key=lambda x: x[1], reverse=True)
+                top_features = features[:20]
+                
+                names = [f[0] for f in top_features]
+                values = [f[1] for f in top_features]
+                
+                # 设置英文字体
+                plt.rcParams['font.family'] = 'DejaVu Sans'
+                
+                plt.barh(names, values, color='lightgreen')
+                plt.title('Feature Importance Estimation (Based on Model Weights)')
+                plt.xlabel('Normalized Importance')
+                plt.tight_layout()
+                plt.savefig('feature_importance_estimated.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                print("特征重要性估计完成，图表已保存。")
+                print("\n估计的最重要10个特征:")
+                for idx, (feature, importance) in enumerate(features[:10]):
+                    print(f"{idx+1}. {feature}: {importance:.4f}")
+                
+                return importance_from_weights
+                
+            except Exception as weight_err:
+                print(f"尝试分析模型权重时出错: {weight_err}")
+                traceback.print_exc()
+                print("SHAP分析失败。无法提取特征重要性。")
+                return None
+    
+    except Exception as e:
+        print(f"SHAP分析过程中发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# 创建原子特征名称映射函数
+def get_atom_feature_names():
+    """返回原子特征的名称列表"""
+    basic_features = [
+        "Atomic_Number", "Degree", "Formal_Charge", "Radical_Electrons", "Is_Aromatic", 
+        "Atomic_Mass", "Explicit_Valence", "Implicit_Valence", "Total_Valence", "Implicit_Hs",
+        "In_Ring", "Hybridization"
+    ]
+    
+    electronic_features = [
+        "Total_Hs", "Total_Degree", "Total_Valence", "Explicit_Valence", 
+        "Implicit_Valence", "Formal_Charge", "Radical_Electrons"
+    ]
+    
+    ring_features = [
+        "In_Ring3", "In_Ring4", "In_Ring5", "In_Ring6", "In_Ring7"
+    ]
+    
+    chirality_features = [
+        "Is_Chiral", "Has_CIP"
+    ]
+    
+    # 元素周期表元素 (1-118)
+    element_features = [f"Element_{i}" for i in range(1, 119)]
+    
+    # 杂化类型
+    hybridization_features = [
+        "Hybrid_SP", "Hybrid_SP2", "Hybrid_SP3", "Hybrid_SP3D", "Hybrid_SP3D2"
+    ]
+    
+    # 化学性质
+    chemical_features = [
+        "Lipophilicity", "Molar_Refractivity", "E_state_Index"
+    ]
+    
+    # 周期表性质
+    periodic_features = [
+        "Group", "Period"
+    ]
+    
+    # 组合所有特征名称
+    all_feature_names = (
+        basic_features + 
+        electronic_features + 
+        ring_features + 
+        chirality_features +
+        element_features +
+        hybridization_features +
+        chemical_features +
+        periodic_features
+    )
+    
+    return all_feature_names
+
+def train_model(dataframe, device='cuda'):
+    """训练模型的主函数"""
+    print(f"Using device: {device}")
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+    
+    print("Data preview:")
+    print(dataframe.head())
+    print("\nData statistics:")
+    print(dataframe.describe())
+    
+    # Plot y distribution before training
+    plot_y_distribution(dataframe['y'].values)
+    
+    # Create dataset
+    dataset = []
+    for _, row in tqdm(dataframe.iterrows(), desc="Processing data"):
+        graph = smiles_to_graph(row['x'])
+        if graph is not None:
+            graph.y = torch.tensor([row['y']], dtype=torch.float)
+            dataset.append(graph)
+    
+    # Data standardization
+    y_values = torch.tensor([data.y.item() for data in dataset])
+    y_mean = y_values.mean()
+    y_std = y_values.std()
+    
+    print(f"\nTarget value statistics:")
+    print(f"Mean: {y_mean:.4f}")
+    print(f"Std: {y_std:.4f}")
+    print(f"Min: {y_values.min():.4f}")
+    print(f"Max: {y_values.max():.4f}")
+    
+    # Lists to store loss history
+    train_losses = []
+    val_losses = []
+    
+    # 数据集划分
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.15 * len(dataset))
+    indices = torch.randperm(len(dataset))
+    
+    train_dataset = [dataset[i] for i in indices[:train_size]]
+    val_dataset = [dataset[i] for i in indices[train_size:train_size+val_size]]
+    test_dataset = [dataset[i] for i in indices[train_size+val_size:]]
+    
+    # 数据加载器
+    train_loader = DataLoader(train_dataset, 
+                            batch_size=32,
+                            shuffle=True,
+                            num_workers=0,
+                            pin_memory=True if device=='cuda' else False)
+    
+    val_loader = DataLoader(val_dataset,
+                          batch_size=32,
+                          shuffle=False,
+                          num_workers=0,
+                          pin_memory=True if device=='cuda' else False)
+    
+    test_loader = DataLoader(test_dataset,
+                           batch_size=32,
+                           shuffle=False,
+                           num_workers=0,
+                           pin_memory=True if device=='cuda' else False)
+    
+    # 初始化模型
+    sample_data = dataset[0]
+    model = EnhancedMolecularGraph(
+        num_node_features=sample_data.x.size(1),
+        num_edge_features=sample_data.edge_attr.size(1)
+    ).to(device)
+    
+    # 优化器和学习率调度器
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=0.001,
+        weight_decay=0.01,
+        amsgrad=True
+    )
+    
+    # 添加循环学习率调度器
+    lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
+        optimizer,
+        base_lr=1e-4, 
+        max_lr=5e-3,
+        step_size_up=8 * len(train_loader),
+        cycle_momentum=False,
+        mode='triangular2'
+    )
+    
+    # 常规学习率调度器作为备用
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+        verbose=True
+    )
+    
+    # 初始化混合精度训练
+    scaler = GradScaler()
+    
+    # 训练循环说明:
+    # 1. 使用混合精度训练加速（autocast和GradScaler）
+    # 2. 每个batch后更新循环学习率提高收敛性能
+    # 3. 根据训练进度动态调整温度参数增强离群点处理
+    # 4. 使用自适应加权损失函数关注预测困难样本
+    # 5. 注意: lr_scheduler.step()必须在optimizer.step()之后调用，避免跳过首个学习率值
+    
+    # 训练循环
+    best_val_loss = float('inf')
+    best_model_state = None
+    patience = 15
+    patience_counter = 0
+    max_epochs = 400  # 增加最大训练轮数到400
+    
+    # 离群点处理温度参数
+    initial_temperature = 0.5
+    min_temperature = 0.1
+    max_temperature = 1.0  # 修改最大温度到1.0
+    current_temperature = initial_temperature
+    
+    # 添加跟踪验证性能变化
+    prev_val_r2 = 0.0
+    current_val_r2 = 0.0
+    
+    # 添加权重扰动计数器
+    epochs_since_last_noise = 0
+    
+    for epoch in range(max_epochs):
+        model.train()
+        total_loss = 0
+        
+        # 更新无噪声轮数计数器
+        epochs_since_last_noise += 1
+        
+        # 使用动态温度调整策略（从第二个epoch开始，因为需要前一轮的R²值）
+        if epoch > 0:
+            new_temp, adjustment_type, should_add_noise = dynamic_temperature_adjustment(
+                epoch=epoch,
+                patience_counter=patience_counter,
+                val_r2=current_val_r2,
+                prev_val_r2=prev_val_r2,
+                current_temperature=current_temperature,
+                initial_temp=initial_temperature,
+                min_temp=min_temperature,
+                max_temp=max_temperature,
+                epoch_since_last_noise=epochs_since_last_noise  # 传递无噪声轮数
+            )
+            
+            # 应用温度调整
+            if new_temp != current_temperature:
+                current_temperature = new_temp
+                print(f"温度参数调整[{adjustment_type}]: {current_temperature:.4f}")
+            
+            # 如果需要，添加权重扰动
+            if should_add_noise:
+                # 计算噪声强度 - 严重停滞时使用更大噪声
+                noise_factor = 0.01 * (1 + 0.1 * min(patience_counter - 5, 5))
+                model = add_weight_noise(model, noise_factor=noise_factor)
+                # 扰动后，重置部分耐心计数器，但不完全重置
+                patience_counter = max(0, patience_counter - 3)
+                # 重置无噪声轮数计数器
+                epochs_since_last_noise = 0
+                print(f"添加权重扰动后重置计数器，将在至少20轮后才考虑再次扰动")
+        
+        # Training phase
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{max_epochs} (Train)')
+        for batch in train_pbar:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            
+            with autocast():
+                out = model(batch)
+                
+                # 检查输出中是否有NaN
+                if torch.isnan(out).any():
+                    print(f"警告: 前向传播中检测到NaN，尝试恢复训练")
+                    # 如果检测到NaN，跳过此批次
+                    continue
+                
+                # 使用自适应加权损失函数，关注离群点
+                loss = adaptive_weighted_loss(
+                    out,
+                    batch.y,
+                    temperature=current_temperature,
+                    alpha=0.7  # 均方误差和绝对误差的平衡因子
+                )
+                
+                # 检查损失是否为NaN
+                if torch.isnan(loss).any():
+                    print(f"警告: 损失函数返回NaN，跳过此批次")
+                    continue
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # 更新循环学习率 - 必须在optimizer.step()之后调用
+            # 这避免了PyTorch中的警告: "lr_scheduler.step() before optimizer.step()"
+            lr_scheduler.step()
+            
+            total_loss += loss.item()
+            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        avg_train_loss = total_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        predictions = []
+        true_values = []
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{max_epochs} (Val)'):
+                batch = batch.to(device)
+                out = model(batch)
+                
+                # 检查是否有NaN
+                if torch.isnan(out).any():
+                    print("警告: 验证阶段检测到NaN输出，跳过此批次")
+                    continue
+                
+                # 验证阶段仍使用常规MSE损失计算
+                val_loss += F.mse_loss(out, batch.y).item()
+                
+                pred = out * y_std + y_mean
+                true = batch.y * y_std + y_mean
+                
+                # 过滤掉NaN值以确保指标计算正确
+                valid_indices = ~torch.isnan(pred).squeeze()
+                if valid_indices.any():
+                    predictions.extend(pred[valid_indices].cpu().numpy())
+                    true_values.extend(true[valid_indices].cpu().numpy())
+        
+        val_loss /= len(val_loader)
+        val_losses.append(val_loss)
+        
+        # 安全计算R² - 确保有足够的有效预测
+        if len(predictions) > 10:
+            try:
+                r2 = r2_score(true_values, predictions)
+            except Exception as e:
+                print(f"R²计算错误: {e}")
+                r2 = -1.0  # 错误时使用一个默认的低值
+        else:
+            print("警告: 有效预测数量不足，无法计算R²")
+            r2 = -1.0  # 数据不足时使用默认低值
+        
+        # 更新R²跟踪
+        prev_val_r2 = current_val_r2
+        current_val_r2 = r2
+        
+        print(f'Epoch {epoch+1}/{max_epochs}:')
+        print(f'Train Loss: {avg_train_loss:.4f}')
+        print(f'Val Loss: {val_loss:.4f}')
+        print(f'R²: {r2:.4f}')
+        
+        scheduler.step(val_loss)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict()
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'y_mean': y_mean,
+                'y_std': y_std
+            }, 'best_model.pt')
+            
+            plot_prediction_results(true_values, predictions)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping!")
+                break
+        
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+    
+    # Plot training history
+    plot_training_history(train_losses, val_losses, len(train_losses))
+    
+    # 加载最佳模型进行测试
+    model.load_state_dict(best_model_state)
+    model.eval()
+    test_predictions = []
+    test_true_values = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc='Testing'):
+            batch = batch.to(device)
+            out = model(batch)
+            pred = out * y_std + y_mean
+            true = batch.y * y_std + y_mean
+            test_predictions.extend(pred.cpu().numpy())
+            test_true_values.extend(true.cpu().numpy())
+    
+    test_r2 = r2_score(test_true_values, test_predictions)
+    print(f"\nFinal test results:")
+    print(f"Test set R²: {test_r2:.4f}")
+    
+    # 绘制最终的预测结果
+    plot_prediction_results(test_true_values, test_predictions)
+
+    # 在测试结束后添加SHAP分析
+    print("\n执行SHAP分析，分析特征重要性...")
+    
+    # 获取特征名称
+    feature_names = get_atom_feature_names()
+    
+    # 调用SHAP分析
+    feature_importance = analyze_feature_importance(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        feature_names=feature_names
+    )
+    
+    # 分析并打印特征重要性结果
+    if feature_importance:
+        print("\n特征重要性分析结果：")
+        for feature, importance in sorted(
+            feature_importance.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )[:20]:  # 显示前20个特征
+            print(f"{feature}: {importance:.4f}")
+        
+    return model, test_r2, feature_importance
+
+def predict(smiles, model_path, device='cuda'):
+    """使用保存的模型预测分子性质
+    
+    参数:
+    smiles (str): 分子的SMILES表示
+    model_path (str): 保存的模型路径
+    device (str): 使用的设备，'cuda'或'cpu'
+    
+    返回:
+    float: 预测的分子性质值，如果转换失败则返回None
+    """
+    try:
+        # 确保使用正确的设备
+        device = torch.device(device if torch.cuda.is_available() and device=='cuda' else 'cpu')
+        
+        # 加载模型和参数
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        # 将SMILES转换为图
+        graph = smiles_to_graph(smiles)
+        if graph is None:
+            print(f"无法将SMILES转换为分子图: {smiles}")
+            return None
+        
+        # 加载模型
+        model = EnhancedMolecularGraph(
+            num_node_features=graph.x.size(1),
+            num_edge_features=graph.edge_attr.size(1)
+        ).to(device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 预测
+        model.eval()
+        graph = graph.to(device)
+        with torch.no_grad():
+            out = model(Batch.from_data_list([graph]))
+            # 使用保存的均值和标准差进行反归一化
+            prediction = out.item() * checkpoint['y_std'] + checkpoint['y_mean']
+        
+        return prediction
+        
+    except Exception as e:
+        print(f"预测过程中出错: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# 添加一个模型封装类，使预测更加便捷
+class MolecularPropertyPredictor:
+    """分子性质预测器封装类"""
+    
+    def __init__(self, model_path, device='cuda'):
+        """初始化预测器
+        
+        参数:
+        model_path (str): 保存的模型路径
+        device (str): 使用的设备，'cuda'或'cpu'
+        """
+        self.model_path = model_path
+        self.device = torch.device(device if torch.cuda.is_available() and device=='cuda' else 'cpu')
+        
+        # 加载模型和参数
+        self.checkpoint = torch.load(model_path, map_location=self.device)
+        self.y_mean = self.checkpoint['y_mean']
+        self.y_std = self.checkpoint['y_std']
+        
+        # 备份参数以供后续使用
+        self._loaded_model = None
+        self._sample_graph = None
+    
+    def _lazy_load_model(self, sample_graph):
+        """延迟加载模型，直到第一次预测时
+        
+        参数:
+        sample_graph: 样本图，用于确定模型输入维度
+        """
+        model = EnhancedMolecularGraph(
+            num_node_features=sample_graph.x.size(1),
+            num_edge_features=sample_graph.edge_attr.size(1)
+        ).to(self.device)
+        model.load_state_dict(self.checkpoint['model_state_dict'])
+        model.eval()
+        return model
+    
+    def predict(self, smiles):
+        """预测分子性质
+        
+        参数:
+        smiles (str): 分子的SMILES表示
+        
+        返回:
+        float: 预测的分子性质值，如果转换失败则返回None
+        """
+        try:
+            # 将SMILES转换为图
+            graph = smiles_to_graph(smiles)
+            if graph is None:
+                print(f"无法将SMILES转换为分子图: {smiles}")
+                return None
+            
+            # 如果模型尚未加载，则加载模型
+            if self._loaded_model is None:
+                self._sample_graph = graph
+                self._loaded_model = self._lazy_load_model(graph)
+            
+            # 预测
+            graph = graph.to(self.device)
+            with torch.no_grad():
+                out = self._loaded_model(Batch.from_data_list([graph]))
+                # 使用保存的均值和标准差进行反归一化
+                prediction = out.item() * self.y_std + self.y_mean
+            
+            return prediction
+            
+        except Exception as e:
+            print(f"预测过程中出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def batch_predict(self, smiles_list):
+        """批量预测多个分子的性质
+        
+        参数:
+        smiles_list (list): 分子SMILES字符串列表
+        
+        返回:
+        list: 预测结果列表，对应每个输入SMILES
+        """
+        results = []
+        for smiles in smiles_list:
+            result = self.predict(smiles)
+            results.append(result)
+        return results
+
+# 添加命令行接口函数
+def predict_from_commandline(model_path, smiles=None, smiles_file=None, output_file=None):
+    """从命令行调用模型预测
+    
+    参数:
+    model_path (str): 模型路径
+    smiles (str, optional): 单个SMILES字符串
+    smiles_file (str, optional): 包含多个SMILES字符串的文件路径
+    output_file (str, optional): 输出结果的文件路径
+    """
+    predictor = MolecularPropertyPredictor(model_path)
+    
+    results = []
+    
+    # 处理单个SMILES
+    if smiles:
+        result = predictor.predict(smiles)
+        print(f"SMILES: {smiles}")
+        print(f"预测结果: {result}")
+        results.append((smiles, result))
+    
+    # 处理SMILES文件
+    if smiles_file:
+        try:
+            with open(smiles_file, 'r') as f:
+                smiles_list = [line.strip() for line in f if line.strip()]
+            
+            print(f"从文件加载了{len(smiles_list)}个SMILES")
+            
+            for smiles in smiles_list:
+                result = predictor.predict(smiles)
+                results.append((smiles, result))
+                print(f"SMILES: {smiles}, 预测结果: {result}")
+        
+        except Exception as e:
+            print(f"处理SMILES文件时出错: {e}")
+    
+    # 保存结果
+    if output_file and results:
+        try:
+            with open(output_file, 'w') as f:
+                f.write("SMILES,预测值\n")
+                for smiles, result in results:
+                    f.write(f"{smiles},{result}\n")
+            print(f"结果已保存到: {output_file}")
+        except Exception as e:
+            print(f"保存结果时出错: {e}")
+
+if __name__ == "__main__":
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    try:
+        # 读取数据
+        data_path = "C:\\Users\\21223\\PycharmProjects\\pythonProject\\processed_qm9.csv"
+        df = pd.read_csv(data_path, header=0, dtype={'x': str, 'y': float})
+        
+        print("原始数据统计：")
+        print(df.describe())
+        print(f"原始数据量: {len(df)}")
+        
+        # 数据过滤
+        df = df[(df['y'] >= -5) & (df['y'] <= 5)]
+        
+        print("\n过滤后数据统计：")
+        print(df.describe())
+        print(f"过滤后数据量: {len(df)}")
+        
+        # 直接从头开始训练
+        print("开始训练模型...")
+        model, test_r2, feature_importance = train_model(df, device=device)
+        
+    except Exception as e:
+        print(f"训练过程中出错: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
+    
+    # 添加命令行预测模式
+    import argparse
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "predict":
+        # 创建解析器
+        parser = argparse.ArgumentParser(description='分子性质预测')
+        parser.add_argument('--model', type=str, required=True, help='模型路径')
+        parser.add_argument('--smiles', type=str, help='单个SMILES字符串')
+        parser.add_argument('--file', type=str, help='包含SMILES的文件')
+        parser.add_argument('--output', type=str, help='输出文件路径')
+        
+        # 解析参数
+        args = parser.parse_args(sys.argv[2:])
+        
+        # 执行预测
+        predict_from_commandline(
+            model_path=args.model,
+            smiles=args.smiles,
+            smiles_file=args.file,
+            output_file=args.output
+        )
+        sys.exit(0)
