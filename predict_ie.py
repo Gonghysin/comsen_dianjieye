@@ -379,6 +379,12 @@ def predict_molecule(smiles, model_path="best_model.pt", verbose=True):
         checkpoint = torch.load(model_path, map_location=device)
         y_mean = checkpoint['y_mean']
         y_std = checkpoint['y_std']
+        # 检查模型是否使用标准化
+        use_standardization = not checkpoint.get('no_standardization', False)
+        
+        if verbose:
+            print(f"模型统计信息 - 均值: {y_mean:.4f}, 标准差: {y_std:.4f}")
+            print(f"{'使用' if use_standardization else '不使用'}数据标准化")
         
         # 转换SMILES为图
         graph = smiles_to_graph(smiles)
@@ -404,8 +410,11 @@ def predict_molecule(smiles, model_path="best_model.pt", verbose=True):
         with torch.no_grad():
             batch = Batch.from_data_list([graph])
             prediction = model(batch)
-            # 反归一化得到实际值
-            ionization_energy = prediction.item() * y_std + y_mean
+            # 根据是否使用标准化决定是否需要反标准化
+            if use_standardization:
+                ionization_energy = prediction.item() * y_std + y_mean
+            else:
+                ionization_energy = prediction.item()
         
         return ionization_energy
         
